@@ -95,26 +95,20 @@ async def get_subject_codes(page):
     subjects = []
     for item in capture.get('sections', []):
         data = item.get('data', {})
-        # Ellucian may return [{"code":"ACCOU","description":"Accountancy"}, ...]
-        # or {"subjects": [...]} or {"Subjects": [...]}
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            if 'code' in data[0] or 'Code' in data[0]:
-                for s in data:
-                    code = (s.get('code') or s.get('Code') or '').strip()
-                    name = (s.get('description') or s.get('Description') or
+        if not isinstance(data, dict):
+            continue
+        # PostSearchCriteria response has a Subjects filter-facet array:
+        # [{"Value":"ACCOU","Description":"Accountancy","Count":30,"Selected":true}, ...]
+        for key in ('Subjects', 'subjects'):
+            if key in data and isinstance(data[key], list):
+                for s in data[key]:
+                    code = (s.get('Value') or s.get('value') or
+                            s.get('code') or s.get('Code') or '').strip()
+                    name = (s.get('Description') or s.get('description') or
                             s.get('name') or s.get('Name') or '').strip()
-                    if code:
+                    if code and code not in {sub['code'] for sub in subjects}:
                         subjects.append({'code': code, 'name': name})
-        elif isinstance(data, dict):
-            for key in ('subjects', 'Subjects'):
-                if key in data and isinstance(data[key], list):
-                    for s in data[key]:
-                        code = (s.get('code') or s.get('Code') or '').strip()
-                        name = (s.get('description') or s.get('Description') or
-                                s.get('name') or s.get('Name') or '').strip()
-                        if code:
-                            subjects.append({'code': code, 'name': name})
-                    break
+                break
 
     if subjects:
         print(f"  Found {len(subjects)} subjects via JS intercept")
@@ -217,50 +211,28 @@ async def scrape_subject(page, subject_code, subject_name, debug_api=False):
 
     courses = []
     for item in capture.get('sections', []):
-        data = item.get('data', {})
-        if isinstance(data, dict):
-            for key in ('Sections', 'sections', 'Courses', 'courses', 'Results', 'results'):
-                if key in data and isinstance(data[key], list):
-                    data = data[key]
-                    break
-        if not isinstance(data, list):
+        raw = item.get('data', {})
+        if not isinstance(raw, dict):
             continue
-        for sec in data:
-            if not isinstance(sec, dict):
-                continue
-            course_code = (
-                sec.get('CourseId') or sec.get('CourseNumber') or
-                sec.get('course_code') or sec.get('Number') or ''
-            )
-            course_name = (
-                sec.get('CourseName') or sec.get('Title') or
-                sec.get('course_name') or sec.get('Name') or ''
-            )
-            raw_faculty = (
-                sec.get('Faculty') or sec.get('Instructors') or
-                sec.get('faculty') or sec.get('instructors') or []
-            )
-            if isinstance(raw_faculty, list):
-                names = [
-                    (f.get('Name') or f.get('name') or f.get('InstructorName') or str(f)).strip()
-                    if isinstance(f, dict) else str(f).strip()
-                    for f in raw_faculty
-                ]
-                instructor = '; '.join(n for n in names if n)
-            else:
-                instructor = str(raw_faculty).strip()
-
-            if course_code or course_name or instructor:
+        # PostSearchCriteria response structure (confirmed from live data):
+        #   CourseFullModels[].FullTitleDisplay = "ACCOU-0430 Bookkeeping-A Practical Focus"
+        #   Faculty[] = [{"Value":"0052324","Description":"McBeth, M","Count":7}, ...]
+        faculty_facet = raw.get('Faculty', [])
+        if not faculty_facet:
+            continue
+        for f in faculty_facet:
+            instructor = (f.get('Description') or '').strip()  # "LastName, FirstInitial"
+            if instructor:
                 courses.append({
                     'subject_code': subject_code,
                     'subject_name': subject_name,
-                    'course_code': course_code,
-                    'course_name': course_name,
+                    'course_code': '',
+                    'course_name': '',
                     'instructor': instructor,
                 })
 
     if courses:
-        print(f"      JS intercept → {len(courses)} sections")
+        print(f"      JS intercept → {len(courses)} instructor-subject pairs")
         return courses
 
     # Fallback: DOM parse for course titles only (no instructor data available).

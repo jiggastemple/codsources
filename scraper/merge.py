@@ -120,9 +120,31 @@ def merge_all():
     for r in listing:
         add_record(r)
 
+    # Build a secondary index keyed by "LastName, FirstInitial" for catalog names like "McBeth, M".
+    # The faculty listing uses "LastName, FirstName" so we need a fallback to match on last+initial.
+    initial_index = {}  # "lastname firstinitial" -> normalized_key in `index`
+    for key, record in index.items():
+        name = record.get('name', '')
+        if ',' in name:
+            parts = name.split(',', 1)
+            last = parts[0].strip().lower()
+            first_parts = parts[1].strip().split()
+            if first_parts:
+                initial_index[f"{last} {first_parts[0][0].lower()}"] = key
+
     # Attach course data from course catalog
     for instructor_name, courses in instructor_courses.items():
         key = normalize_name(instructor_name)
+        if key not in index:
+            # Try "LastName, FirstInitial" fallback (catalog uses abbreviated first names)
+            if ',' in instructor_name:
+                parts = instructor_name.split(',', 1)
+                last = parts[0].strip().lower()
+                first_part = parts[1].strip()
+                if first_part:
+                    lookup = f"{last} {first_part[0].lower()}"
+                    key = initial_index.get(lookup, key)
+
         if key in index:
             existing_codes = {c.get('course_code') for c in index[key].get('courses_taught', [])}
             for c in courses:
