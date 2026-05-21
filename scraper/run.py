@@ -7,6 +7,7 @@ Usage:
   python run.py --courses-only      # Only scrape the course catalog, then merge
   python run.py --subjects ACCOU BIOL  # Limit course catalog to specific subjects (for testing)
   python run.py --merge-only        # Re-run merge.py on existing output files
+  python run.py --debug-api --subjects ACCOU  # Log all API calls for one subject to diagnose 0-result issues
 
 All output files are written to the ./output/ directory.
 Raw HTML pages are saved alongside JSON so you can inspect selectors if data looks wrong.
@@ -31,6 +32,7 @@ def main():
     skip_courses          = '--skip-courses' in args or '--merge-only' in args
     courses_only          = '--courses-only' in args
     merge_only            = '--merge-only' in args
+    debug_api             = '--debug-api' in args
 
     limit_subjects = None
     if '--subjects' in args:
@@ -69,7 +71,7 @@ def main():
         print("    pip install playwright && playwright install chromium")
         try:
             from course_catalog import scrape as scrape_courses
-            instructor_map = scrape_courses(limit_subjects=limit_subjects)
+            instructor_map = scrape_courses(limit_subjects=limit_subjects, debug_api=debug_api)
             print(f"  Done. {len(instructor_map)} instructors mapped.")
         except ImportError:
             print("  WARNING: playwright not installed — skipping course catalog.")

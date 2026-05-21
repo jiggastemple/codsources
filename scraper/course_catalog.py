@@ -135,7 +135,7 @@ async def get_subject_codes(page):
     return subjects
 
 
-async def scrape_subject(page, subject_code, subject_name):
+async def scrape_subject(page, subject_code, subject_name, debug_api=False):
     """Scrape all course sections for one subject. Returns list of course dicts.
 
     Instructor data lives in Knockout.js virtual elements that are never stamped
@@ -146,26 +146,43 @@ async def scrape_subject(page, subject_code, subject_name):
     print(f"    {subject_code} ({subject_name}): {url}")
 
     captured = {}
+    debug_log = []  # populated when debug_api=True
 
     async def handle_response(response):
-        if response.request.resource_type not in ('xhr', 'fetch'):
+        rt = response.request.resource_type
+        if rt not in ('xhr', 'fetch'):
             return
-        url_lower = response.url.lower()
-        if not any(kw in url_lower for kw in ('section', 'course', 'catalog', 'search')):
+        resp_url = response.url
+        ct = response.headers.get('content-type', '')
+        status = response.status
+
+        if debug_api:
+            debug_log.append(f"  {status} [{rt}] {ct[:40]:40s}  {resp_url}")
+
+        url_lower = resp_url.lower()
+        # In debug mode accept any JSON response to find the right endpoint.
+        # In normal mode filter to likely Ellucian API paths.
+        url_ok = debug_api or any(
+            kw in url_lower for kw in ('section', 'course', 'catalog', 'search')
+        )
+        if not url_ok or 'json' not in ct:
             return
         try:
-            ct = response.headers.get('content-type', '')
-            if 'json' not in ct:
-                return
             data = await response.json()
             if isinstance(data, list) and data and isinstance(data[0], dict):
                 sample = str(data[0]).lower()
-                if any(k in sample for k in ('faculty', 'instructor', 'section', 'coursename')):
+                if debug_api or any(
+                    k in sample for k in ('faculty', 'instructor', 'section', 'coursename')
+                ):
                     captured.setdefault('sections', []).extend(data)
+                    if debug_api:
+                        print(f"      [debug] captured list response ({len(data)} items) from {resp_url[:80]}")
             elif isinstance(data, dict):
                 for key in ('Sections', 'sections', 'Courses', 'courses', 'Results', 'results'):
                     if key in data and isinstance(data[key], list):
                         captured.setdefault('sections', []).extend(data[key])
+                        if debug_api:
+                            print(f"      [debug] captured dict[{key!r}] ({len(data[key])} items) from {resp_url[:80]}")
                         break
         except Exception:
             pass
@@ -177,6 +194,13 @@ async def scrape_subject(page, subject_code, subject_name):
         print(f"      Navigation error: {e}")
     await asyncio.sleep(5)
     page.remove_listener('response', handle_response)
+
+    if debug_api:
+        log_path = os.path.join(OUTPUT_DIR, f'debug_api_{subject_code}.txt')
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write(f"All XHR/fetch responses for subject {subject_code}:\n\n")
+            f.write('\n'.join(debug_log) or '  (none captured)')
+        print(f"      [debug] {len(debug_log)} XHR/fetch responses logged → {log_path}")
 
     courses = []
 
@@ -242,10 +266,12 @@ async def scrape_subject(page, subject_code, subject_name):
     return courses
 
 
-async def run(limit_subjects=None):
+async def run(limit_subjects=None, debug_api=False):
     """
     limit_subjects: optional list of subject codes (e.g. ['ACCOU', 'BIOL'])
                     to restrict the scrape — useful for testing.
+    debug_api:      log all XHR/fetch URLs to output/debug_api_<SUBJ>.txt so you
+                    can identify the real Ellucian API endpoint patterns.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     all_courses = []
@@ -282,7 +308,7 @@ async def run(limit_subjects=None):
 
         for i, subj in enumerate(subjects):
             print(f"  [{i + 1}/{len(subjects)}]", end=' ')
-            courses = await scrape_subject(page, subj['code'], subj['name'])
+            courses = await scrape_subject(page, subj['code'], subj['name'], debug_api=debug_api)
             all_courses.extend(courses)
             await asyncio.sleep(1.0)
 
@@ -322,10 +348,11 @@ async def run(limit_subjects=None):
     return instructor_map
 
 
-def scrape(limit_subjects=None):
-    return asyncio.run(run(limit_subjects=limit_subjects))
+def scrape(limit_subjects=None, debug_api=False):
+    return asyncio.run(run(limit_subjects=limit_subjects, debug_api=debug_api))
 
 
 if __name__ == '__main__':
-    limit = sys.argv[1:] if len(sys.argv) > 1 else None
-    scrape(limit_subjects=limit)
+    _debug = '--debug-api' in sys.argv
+    _args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    scrape(limit_subjects=_args or None, debug_api=_debug)
