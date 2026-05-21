@@ -1,18 +1,20 @@
 """
 Scrapes https://selfserv.cod.edu/Student/Courses/Search using Playwright.
 
-selfserv.cod.edu is an Ellucian Colleague Self-Service SPA (React). Simple HTTP
+selfserv.cod.edu is an Ellucian Colleague Self-Service SPA (Knockout.js). Simple HTTP
 requests won't work — we need a real browser to let the JS render.
 
 Strategy:
-1. Open the course search page and wait for it to fully load.
-2. Find the subject/department filter and collect all available subject codes.
-3. For each subject, navigate to its filtered URL and scrape all course sections.
-4. Extract: subject, course code, course name, instructor name(s).
-5. Build a dict mapping instructor_name -> list of courses taught.
+1. Inject a JS interceptor that patches window.fetch and XMLHttpRequest so every JSON
+   API response is captured into window.__codApiCapture before any SPA code runs.
+2. Navigate to the course search page; collect subject codes from captured API responses.
+3. For each subject, navigate to its filtered URL, wait for background API calls to finish,
+   then read window.__codApiCapture for section/instructor data.
+4. Build a dict mapping instructor_name -> list of courses taught.
 
 Run with:  python course_catalog.py
            python course_catalog.py --subjects ACCOU BIOL  (limit to specific subjects)
+           python course_catalog.py --debug-api ACCOU      (log all API calls for ACCOU)
 """
 
 import asyncio
@@ -23,36 +25,63 @@ import sys
 from playwright.async_api import async_playwright
 from config import COURSE_CATALOG_BASE, OUTPUT_DIR, CHROMIUM_PATH
 
-SCROLL_PAUSE = 1.5      # seconds to pause after each scroll
 PAGE_LOAD_TIMEOUT = 30000  # ms
+
+# Injected into every page before SPA code runs. Patches fetch + XHR so every
+# JSON response is stored in window.__codApiCapture for Python to read back.
+_JS_INTERCEPTOR = """
+window.__codApiCapture = { sections: [], log: [] };
+
+const _origFetch = window.fetch;
+window.fetch = async function(...args) {
+    const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+    const resp = await _origFetch.apply(this, args);
+    const clone = resp.clone();
+    const ct = resp.headers.get('content-type') || '';
+    window.__codApiCapture.log.push({ url, status: resp.status, ct, type: 'fetch' });
+    if (ct.includes('json')) {
+        try {
+            const data = await clone.json();
+            window.__codApiCapture.sections.push({ url, data });
+        } catch(e) {}
+    }
+    return resp;
+};
+
+const _origOpen = XMLHttpRequest.prototype.open;
+const _origSend = XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open = function(method, url) {
+    this._captureUrl = url;
+    return _origOpen.apply(this, arguments);
+};
+XMLHttpRequest.prototype.send = function() {
+    this.addEventListener('load', function() {
+        const ct = this.getResponseHeader('content-type') || '';
+        window.__codApiCapture.log.push({
+            url: this._captureUrl, status: this.status, ct, type: 'xhr'
+        });
+        if (ct.includes('json') && this.responseText) {
+            try {
+                window.__codApiCapture.sections.push({
+                    url: this._captureUrl,
+                    data: JSON.parse(this.responseText)
+                });
+            } catch(e) {}
+        }
+    });
+    return _origSend.apply(this, arguments);
+};
+"""
 
 
 async def get_subject_codes(page):
     """
     Get all course subject codes from the Ellucian Self-Service subjects API.
 
-    The course search SPA loads subjects via a background JSON API call.
-    We intercept that response directly rather than trying to read the
-    dynamically-rendered UI, which is empty on initial page load.
+    Reads from window.__codApiCapture (populated by _JS_INTERCEPTOR) after the
+    subjects page loads. Falls back to embedded JSON then a hardcoded list.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    subjects = []
-    api_response = {}
-
-    # Intercept the subjects API response as the page loads
-    async def handle_response(response):
-        if 'subjects' in response.url.lower() or 'catalog' in response.url.lower():
-            try:
-                data = await response.json()
-                if isinstance(data, list) and data and 'code' in data[0]:
-                    api_response['subjects'] = data
-                elif isinstance(data, dict) and 'subjects' in data:
-                    api_response['subjects'] = data['subjects']
-            except Exception:
-                pass
-
-    page.on('response', handle_response)
 
     print("  Navigating to course search (watching for subjects API call)...")
     try:
@@ -60,17 +89,35 @@ async def get_subject_codes(page):
     except Exception as e:
         print(f"  Navigation warning: {e}")
 
-    page.remove_listener('response', handle_response)
     await page.screenshot(path=os.path.join(OUTPUT_DIR, 'course_catalog_subjects.png'), full_page=True)
 
-    if api_response.get('subjects'):
-        raw = api_response['subjects']
-        for s in raw:
-            code = s.get('code', '').strip()
-            name = s.get('description', s.get('name', '')).strip()
-            if code:
-                subjects.append({'code': code, 'name': name})
-        print(f"  Found {len(subjects)} subjects via API interception")
+    capture = await page.evaluate("() => window.__codApiCapture || {sections:[], log:[]}")
+    subjects = []
+    for item in capture.get('sections', []):
+        data = item.get('data', {})
+        # Ellucian may return [{"code":"ACCOU","description":"Accountancy"}, ...]
+        # or {"subjects": [...]} or {"Subjects": [...]}
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            if 'code' in data[0] or 'Code' in data[0]:
+                for s in data:
+                    code = (s.get('code') or s.get('Code') or '').strip()
+                    name = (s.get('description') or s.get('Description') or
+                            s.get('name') or s.get('Name') or '').strip()
+                    if code:
+                        subjects.append({'code': code, 'name': name})
+        elif isinstance(data, dict):
+            for key in ('subjects', 'Subjects'):
+                if key in data and isinstance(data[key], list):
+                    for s in data[key]:
+                        code = (s.get('code') or s.get('Code') or '').strip()
+                        name = (s.get('description') or s.get('Description') or
+                                s.get('name') or s.get('Name') or '').strip()
+                        if code:
+                            subjects.append({'code': code, 'name': name})
+                    break
+
+    if subjects:
+        print(f"  Found {len(subjects)} subjects via JS intercept")
         return subjects
 
     # Fallback: read subjects from the embedded JSON in the page HTML.
@@ -79,8 +126,7 @@ async def get_subject_codes(page):
     m = re.search(r'jsonData\s*=\s*(\{.*?\});', content, re.DOTALL)
     if m:
         try:
-            import json as _json
-            data = _json.loads(m.group(1))
+            data = json.loads(m.group(1))
             raw = data.get('subjects', [])
             for s in raw:
                 code = s.get('code', '').strip()
@@ -93,10 +139,7 @@ async def get_subject_codes(page):
         except Exception:
             pass
 
-    # Last resort: use the known COD department checkbox values from the faculty
-    # listing page as subject code seeds. These are lowercase department slugs
-    # but many match Ellucian subject codes (e.g. "accountancy" → "ACCOU").
-    # We include a curated list of common COD subject codes as a reliable fallback.
+    # Last resort: curated list of known COD subject codes.
     print("  WARNING: API interception found no subjects. Using known COD subject codes.")
     fallback_subjects = [
         ('ACCOU', 'Accountancy'), ('ADMAP', 'Administrative Management'),
@@ -125,7 +168,7 @@ async def get_subject_codes(page):
         ('SIGN', 'Sign Language Interpreting'), ('SOCI', 'Sociology'),
         ('SPAN', 'Spanish'), ('SPED', 'Special Education'),
         ('SRGT', 'Surgical Technology'), ('THEA', 'Theatre'),
-        ('WELD', 'Welding'), ('WMST', 'Women\'s Studies'),
+        ('WELD', 'Welding'), ('WMST', "Women's Studies"),
     ]
     subjects = [{'code': c, 'name': n} for c, n in fallback_subjects]
     print(f"  Using {len(subjects)} fallback subject codes")
@@ -138,74 +181,48 @@ async def get_subject_codes(page):
 async def scrape_subject(page, subject_code, subject_name, debug_api=False):
     """Scrape all course sections for one subject. Returns list of course dicts.
 
-    Instructor data lives in Knockout.js virtual elements that are never stamped
-    into the static DOM — we must intercept the background JSON API calls instead.
-    DOM parsing is kept as a fallback to at least capture course titles/descriptions.
+    Reads from window.__codApiCapture (populated by _JS_INTERCEPTOR). Instructor
+    data lives in KO virtual elements never rendered into the DOM, so API
+    interception is the only reliable source. DOM parsing is kept as a fallback
+    to preserve at least course titles when no API data is available.
     """
     url = f"{COURSE_CATALOG_BASE}?subjects={subject_code}"
     print(f"    {subject_code} ({subject_name}): {url}")
 
-    captured = {}
-    debug_log = []  # populated when debug_api=True
-
-    async def handle_response(response):
-        rt = response.request.resource_type
-        if rt not in ('xhr', 'fetch'):
-            return
-        resp_url = response.url
-        ct = response.headers.get('content-type', '')
-        status = response.status
-
-        if debug_api:
-            debug_log.append(f"  {status} [{rt}] {ct[:40]:40s}  {resp_url}")
-
-        url_lower = resp_url.lower()
-        # In debug mode accept any JSON response to find the right endpoint.
-        # In normal mode filter to likely Ellucian API paths.
-        url_ok = debug_api or any(
-            kw in url_lower for kw in ('section', 'course', 'catalog', 'search')
-        )
-        if not url_ok or 'json' not in ct:
-            return
-        try:
-            data = await response.json()
-            if isinstance(data, list) and data and isinstance(data[0], dict):
-                sample = str(data[0]).lower()
-                if debug_api or any(
-                    k in sample for k in ('faculty', 'instructor', 'section', 'coursename')
-                ):
-                    captured.setdefault('sections', []).extend(data)
-                    if debug_api:
-                        print(f"      [debug] captured list response ({len(data)} items) from {resp_url[:80]}")
-            elif isinstance(data, dict):
-                for key in ('Sections', 'sections', 'Courses', 'courses', 'Results', 'results'):
-                    if key in data and isinstance(data[key], list):
-                        captured.setdefault('sections', []).extend(data[key])
-                        if debug_api:
-                            print(f"      [debug] captured dict[{key!r}] ({len(data[key])} items) from {resp_url[:80]}")
-                        break
-        except Exception:
-            pass
-
-    page.on('response', handle_response)
     try:
         await page.goto(url, wait_until='networkidle', timeout=PAGE_LOAD_TIMEOUT)
     except Exception as e:
         print(f"      Navigation error: {e}")
-    await asyncio.sleep(5)
-    page.remove_listener('response', handle_response)
+    await asyncio.sleep(5)  # give KO time to finish all background API calls
+
+    capture = await page.evaluate("() => window.__codApiCapture || {sections:[], log:[]}")
 
     if debug_api:
         log_path = os.path.join(OUTPUT_DIR, f'debug_api_{subject_code}.txt')
         with open(log_path, 'w', encoding='utf-8') as f:
-            f.write(f"All XHR/fetch responses for subject {subject_code}:\n\n")
-            f.write('\n'.join(debug_log) or '  (none captured)')
-        print(f"      [debug] {len(debug_log)} XHR/fetch responses logged → {log_path}")
+            f.write(f"API calls captured for {subject_code}:\n\n")
+            for entry in capture.get('log', []):
+                f.write(
+                    f"  {entry.get('status')} [{entry.get('type')}] "
+                    f"{(entry.get('ct') or '')[:40]:40s}  {entry.get('url', '')}\n"
+                )
+            if not capture.get('log'):
+                f.write("  (none — window.__codApiCapture.log is empty)\n")
+        print(f"      [debug] {len(capture.get('log', []))} API calls logged → {log_path}")
 
     courses = []
-
-    if captured.get('sections'):
-        for sec in captured['sections']:
+    for item in capture.get('sections', []):
+        data = item.get('data', {})
+        if isinstance(data, dict):
+            for key in ('Sections', 'sections', 'Courses', 'courses', 'Results', 'results'):
+                if key in data and isinstance(data[key], list):
+                    data = data[key]
+                    break
+        if not isinstance(data, list):
+            continue
+        for sec in data:
+            if not isinstance(sec, dict):
+                continue
             course_code = (
                 sec.get('CourseId') or sec.get('CourseNumber') or
                 sec.get('course_code') or sec.get('Number') or ''
@@ -219,15 +236,12 @@ async def scrape_subject(page, subject_code, subject_name, debug_api=False):
                 sec.get('faculty') or sec.get('instructors') or []
             )
             if isinstance(raw_faculty, list):
-                names = []
-                for f in raw_faculty:
-                    if isinstance(f, dict):
-                        n = f.get('Name') or f.get('name') or f.get('InstructorName') or ''
-                    else:
-                        n = str(f)
-                    if n:
-                        names.append(n.strip())
-                instructor = '; '.join(names)
+                names = [
+                    (f.get('Name') or f.get('name') or f.get('InstructorName') or str(f)).strip()
+                    if isinstance(f, dict) else str(f).strip()
+                    for f in raw_faculty
+                ]
+                instructor = '; '.join(n for n in names if n)
             else:
                 instructor = str(raw_faculty).strip()
 
@@ -239,11 +253,12 @@ async def scrape_subject(page, subject_code, subject_name, debug_api=False):
                     'course_name': course_name,
                     'instructor': instructor,
                 })
-        print(f"      API interception → {len(courses)} sections")
+
+    if courses:
+        print(f"      JS intercept → {len(courses)} sections")
         return courses
 
-    # Fallback: API interception captured nothing — parse DOM for course titles only.
-    # Instructors are unavailable this way (they live in KO virtual elements).
+    # Fallback: DOM parse for course titles only (no instructor data available).
     print(f"      WARNING: no API data captured for {subject_code} — trying DOM fallback")
     content = await page.content()
     from bs4 import BeautifulSoup
@@ -270,7 +285,7 @@ async def run(limit_subjects=None, debug_api=False):
     """
     limit_subjects: optional list of subject codes (e.g. ['ACCOU', 'BIOL'])
                     to restrict the scrape — useful for testing.
-    debug_api:      log all XHR/fetch URLs to output/debug_api_<SUBJ>.txt so you
+    debug_api:      log all API calls to output/debug_api_<SUBJ>.txt so you
                     can identify the real Ellucian API endpoint patterns.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -291,6 +306,7 @@ async def run(limit_subjects=None, debug_api=False):
             ignore_https_errors=True,
         )
         page = await context.new_page()
+        await page.add_init_script(_JS_INTERCEPTOR)
 
         print(f"\n[course_catalog] Collecting subject codes...")
         subjects = await get_subject_codes(page)
