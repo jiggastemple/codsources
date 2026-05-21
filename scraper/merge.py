@@ -33,13 +33,24 @@ def load_json(path, default=None):
 def infer_cod_email(name):
     """
     COD email pattern: firstname.lastname@cod.edu
-    Works for most faculty; returns empty string if name can't be parsed.
+
+    Handles both name formats found across sources:
+      "Last, First"  (faculty listing cards)
+      "First Last"   (faculty profile pages)
     """
-    parts = name.strip().split()
-    if len(parts) < 2:
-        return ''
-    first = re.sub(r'[^a-z]', '', parts[0].lower())
-    last = re.sub(r'[^a-z]', '', parts[-1].lower())
+    name = name.strip()
+    if ',' in name:
+        # "Last, First Middle" format
+        parts = name.split(',', 1)
+        last = re.sub(r'[^a-z]', '', parts[0].strip().lower())
+        first = re.sub(r'[^a-z]', '', parts[1].strip().split()[0].lower())
+    else:
+        # "First Last" format
+        parts = name.split()
+        if len(parts) < 2:
+            return ''
+        first = re.sub(r'[^a-z]', '', parts[0].lower())
+        last = re.sub(r'[^a-z]', '', parts[-1].lower())
     if first and last:
         return f"{first}.{last}@cod.edu"
     return ''

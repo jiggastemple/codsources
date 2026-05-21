@@ -29,77 +29,108 @@ PAGE_LOAD_TIMEOUT = 30000  # ms
 
 async def get_subject_codes(page):
     """
-    Navigate to the course search page and extract all subject codes from the
-    filter UI. Falls back to reading them from the URL query string of filter links.
-    """
-    print("  Navigating to course search to collect subject codes...")
-    await page.goto(COURSE_CATALOG_BASE, wait_until='networkidle', timeout=PAGE_LOAD_TIMEOUT)
+    Get all course subject codes from the Ellucian Self-Service subjects API.
 
-    # Save a screenshot for inspection
+    The course search SPA loads subjects via a background JSON API call.
+    We intercept that response directly rather than trying to read the
+    dynamically-rendered UI, which is empty on initial page load.
+    """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    await page.screenshot(path=os.path.join(OUTPUT_DIR, 'course_catalog_subjects.png'), full_page=True)
 
     subjects = []
+    api_response = {}
 
-    # Try: subject select/dropdown
-    select_el = await page.query_selector(
-        'select[id*="subject"], select[name*="subject"], select[aria-label*="subject" i]'
-    )
-    if select_el:
-        options = await page.query_selector_all(
-            'select[id*="subject"] option, select[name*="subject"] option'
-        )
-        for opt in options:
-            value = await opt.get_attribute('value')
-            text = await opt.inner_text()
-            value = (value or '').strip()
-            text = (text or '').strip()
-            if value and value.lower() not in ('', 'all', 'select', 'any'):
-                subjects.append({'code': value, 'name': text})
-        if subjects:
-            print(f"  Found {len(subjects)} subjects via <select>")
-            return subjects
+    # Intercept the subjects API response as the page loads
+    async def handle_response(response):
+        if 'subjects' in response.url.lower() or 'catalog' in response.url.lower():
+            try:
+                data = await response.json()
+                if isinstance(data, list) and data and 'code' in data[0]:
+                    api_response['subjects'] = data
+                elif isinstance(data, dict) and 'subjects' in data:
+                    api_response['subjects'] = data['subjects']
+            except Exception:
+                pass
 
-    # Try: links with ?subjects= in href
-    links = await page.query_selector_all('a[href*="subjects="]')
-    seen = set()
-    for link in links:
-        href = await link.get_attribute('href') or ''
-        m = re.search(r'subjects=([A-Z0-9]+)', href)
-        if m:
-            code = m.group(1)
-            if code not in seen:
-                seen.add(code)
-                text = await link.inner_text()
-                subjects.append({'code': code, 'name': text.strip()})
-    if subjects:
-        print(f"  Found {len(subjects)} subjects via href links")
+    page.on('response', handle_response)
+
+    print("  Navigating to course search (watching for subjects API call)...")
+    try:
+        await page.goto(COURSE_CATALOG_BASE, wait_until='networkidle', timeout=PAGE_LOAD_TIMEOUT)
+    except Exception as e:
+        print(f"  Navigation warning: {e}")
+
+    await page.screenshot(path=os.path.join(OUTPUT_DIR, 'course_catalog_subjects.png'), full_page=True)
+
+    if api_response.get('subjects'):
+        raw = api_response['subjects']
+        for s in raw:
+            code = s.get('code', '').strip()
+            name = s.get('description', s.get('name', '')).strip()
+            if code:
+                subjects.append({'code': code, 'name': name})
+        print(f"  Found {len(subjects)} subjects via API interception")
         return subjects
 
-    # Try: checkboxes or filter items with subject codes (common in Colleague Self-Service)
-    items = await page.query_selector_all(
-        '[data-subject], [data-value*="subject"], '
-        'input[value*="ACCOU"], input[value*="BIOL"], '  # probe for known codes
-        'label[for*="subject"]'
-    )
-    for item in items:
-        value = (await item.get_attribute('data-subject') or
-                 await item.get_attribute('data-value') or
-                 await item.get_attribute('value') or '')
-        text = await item.inner_text()
-        value = value.strip()
-        if value and value not in seen:
-            seen.add(value)
-            subjects.append({'code': value, 'name': text.strip()})
+    # Fallback: read subjects from the embedded JSON in the page HTML.
+    # Ellucian embeds initial state as Ellucian.Course.SearchResult.jsonData = {...}
+    content = await page.content()
+    m = re.search(r'jsonData\s*=\s*(\{.*?\});', content, re.DOTALL)
+    if m:
+        try:
+            import json as _json
+            data = _json.loads(m.group(1))
+            raw = data.get('subjects', [])
+            for s in raw:
+                code = s.get('code', '').strip()
+                name = s.get('description', s.get('name', '')).strip()
+                if code:
+                    subjects.append({'code': code, 'name': name})
+            if subjects:
+                print(f"  Found {len(subjects)} subjects via embedded JSON")
+                return subjects
+        except Exception:
+            pass
 
-    if not subjects:
-        print("  WARNING: Could not find subject list from UI.")
-        print("  Saving full page HTML for manual inspection...")
-        content = await page.content()
-        with open(os.path.join(OUTPUT_DIR, 'course_catalog_page.html'), 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"  Saved → {OUTPUT_DIR}/course_catalog_page.html")
-
+    # Last resort: use the known COD department checkbox values from the faculty
+    # listing page as subject code seeds. These are lowercase department slugs
+    # but many match Ellucian subject codes (e.g. "accountancy" → "ACCOU").
+    # We include a curated list of common COD subject codes as a reliable fallback.
+    print("  WARNING: API interception found no subjects. Using known COD subject codes.")
+    fallback_subjects = [
+        ('ACCOU', 'Accountancy'), ('ADMAP', 'Administrative Management'),
+        ('ANTH', 'Anthropology'), ('ART', 'Art'), ('ARTH', 'Art History'),
+        ('ASL', 'American Sign Language'), ('ASTR', 'Astronomy'),
+        ('AUTO', 'Automotive Technology'), ('BIOL', 'Biology'),
+        ('BSAD', 'Business Administration'), ('CHEM', 'Chemistry'),
+        ('CHIN', 'Chinese'), ('CIS', 'Computer Information Systems'),
+        ('CMET', 'Construction Management'), ('COMM', 'Communication'),
+        ('CRIM', 'Criminal Justice'), ('CSCI', 'Computer Science'),
+        ('DENT', 'Dental Hygiene'), ('ECON', 'Economics'),
+        ('EDUC', 'Education'), ('ELEC', 'Electronics'),
+        ('EMS', 'Emergency Medical Services'), ('ENGL', 'English'),
+        ('ENGR', 'Engineering'), ('ESL', 'English as a Second Language'),
+        ('FILM', 'Film'), ('FREN', 'French'), ('GEOG', 'Geography'),
+        ('GEOL', 'Geology'), ('GERM', 'German'), ('HEAL', 'Health Education'),
+        ('HIST', 'History'), ('HORT', 'Horticulture'),
+        ('HOSP', 'Hospitality Management'), ('HUSR', 'Human Services'),
+        ('ITAL', 'Italian'), ('JAPN', 'Japanese'), ('JOUR', 'Journalism'),
+        ('KINE', 'Kinesiology'), ('LATN', 'Latin'), ('MATH', 'Mathematics'),
+        ('MDIA', 'Media Arts'), ('MGMT', 'Management'), ('MKTG', 'Marketing'),
+        ('MUSC', 'Music'), ('NURS', 'Nursing'), ('PHAR', 'Pharmacy Tech'),
+        ('PHIL', 'Philosophy'), ('PHYS', 'Physics'), ('POLS', 'Political Science'),
+        ('PSYC', 'Psychology'), ('RADT', 'Radiologic Technology'),
+        ('READ', 'Reading'), ('RESP', 'Respiratory Care'),
+        ('SIGN', 'Sign Language Interpreting'), ('SOCI', 'Sociology'),
+        ('SPAN', 'Spanish'), ('SPED', 'Special Education'),
+        ('SRGT', 'Surgical Technology'), ('THEA', 'Theatre'),
+        ('WELD', 'Welding'), ('WMST', 'Women\'s Studies'),
+    ]
+    subjects = [{'code': c, 'name': n} for c, n in fallback_subjects]
+    print(f"  Using {len(subjects)} fallback subject codes")
+    with open(os.path.join(OUTPUT_DIR, 'course_catalog_page.html'), 'w', encoding='utf-8') as f:
+        f.write(content)
+    print(f"  Saved page HTML → {OUTPUT_DIR}/course_catalog_page.html")
     return subjects
 
 
@@ -114,22 +145,21 @@ async def scrape_subject(page, subject_code, subject_name):
         print(f"      Navigation error: {e}")
         return []
 
-    courses = []
-    # Scroll to trigger lazy-loaded content
-    prev_count = 0
-    for _ in range(20):
-        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-        await asyncio.sleep(SCROLL_PAUSE)
-
-        # Count current course items
-        items = await page.query_selector_all(
-            '.course-section, .section-listing, [class*="course-section"], '
-            '[class*="section-result"], .search-result-item, article.course, '
-            'tr.section-row, .availability-section'
+    # Wait for Ellucian's Knockout.js to finish rendering course results.
+    # The spinner disappears and a results container appears when loading is done.
+    try:
+        await page.wait_for_selector(
+            '#course-search-result .esg-col-sm-9, '
+            '#course-search-result .esg-col-md-9, '
+            '.catalog-course, .esg-course, '
+            '[data-bind*="courses"], [data-bind*="sections"]',
+            timeout=15000,
         )
-        if len(items) == prev_count and prev_count > 0:
-            break  # no new items loaded
-        prev_count = len(items)
+        await asyncio.sleep(SCROLL_PAUSE)
+    except Exception:
+        pass  # selector didn't appear; try extracting whatever is there
+
+    courses = []
 
     # Extract course data
     content = await page.content()

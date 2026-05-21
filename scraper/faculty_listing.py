@@ -7,7 +7,6 @@ COD's server blocks plain requests — a real browser is required.
 import asyncio
 import json
 import os
-import re
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from config import FACULTY_LISTING_BASE, COD_BASE_URL, OUTPUT_DIR, CHROMIUM_PATH
@@ -17,6 +16,15 @@ PAGE_LOAD_TIMEOUT = 20000
 
 
 def parse_faculty_card(card_el):
+    """
+    Parse a single .FacultyCard element.
+
+    COD card structure (confirmed from live HTML):
+      .FacultyCard__name      → "Last, First" format
+      .FacultyCard__title     → department/subject area (misleadingly named)
+      .FacultyCard__position  → appears twice: role first, then email paragraph
+      mailto: link            → confirmed COD email address
+    """
     record = {
         'name': '',
         'title': '',
@@ -30,113 +38,39 @@ def parse_faculty_card(card_el):
         'source': ['faculty_listing'],
     }
 
-    for sel in ['.faculty-name', '.name', 'h2', 'h3', 'h4',
-                '[class*="name"]', 'strong', '.card-title']:
-        el = card_el.select_one(sel)
-        if el and el.get_text(strip=True):
-            record['name'] = el.get_text(strip=True)
-            break
+    name_el = card_el.select_one('.FacultyCard__name')
+    if name_el:
+        record['name'] = name_el.get_text(strip=True)
 
-    for sel in ['.faculty-title', '.title', '.position', '.job-title',
-                '[class*="title"]', '[class*="position"]', '.card-subtitle']:
-        el = card_el.select_one(sel)
-        txt = el.get_text(strip=True) if el else ''
-        if txt and txt != record['name']:
-            record['title'] = txt
-            break
+    # FacultyCard__title holds the department/subject area
+    dept_el = card_el.select_one('.FacultyCard__title')
+    if dept_el:
+        dept = dept_el.get_text(strip=True)
+        if dept:
+            record['departments'] = [dept]
 
-    for sel in ['.department', '.dept', '[class*="department"]',
-                '[class*="dept"]', '.division']:
-        el = card_el.select_one(sel)
-        if el and el.get_text(strip=True):
-            record['departments'] = [el.get_text(strip=True)]
-            break
+    # FacultyCard__position appears twice: first = role, second = email line
+    position_els = card_el.select('.FacultyCard__position')
+    for el in position_els:
+        text = el.get_text(strip=True)
+        if not record['title'] and text and 'email' not in text.lower():
+            record['title'] = text
 
+    # Email is in a mailto: link inside the card
     record['email'] = extract_email(card_el)
-    record['phone'] = extract_phone(card_el.get_text())
-
-    link = card_el.select_one('a[href]')
-    if link:
-        record['faculty_page_url'] = make_absolute(link['href'])
-
-    img = card_el.select_one('img')
-    if img and img.get('src'):
-        record['photo_url'] = make_absolute(img['src'])
-
-    for sel in ['.bio', '.excerpt', '.description', '.summary', 'p']:
-        el = card_el.select_one(sel)
-        if el:
-            txt = el.get_text(strip=True)
-            if len(txt) > 30 and txt != record['name']:
-                record['bio'] = txt[:1000]
-                break
 
     return record
 
 
-def get_total_pages(soup):
-    for sel in ['.pagination a', '.pager a', 'nav[aria-label*="page"] a',
-                'a[href*="page="]']:
-        links = soup.select(sel)
-        page_nums = []
-        for link in links:
-            m = re.search(r'page=(\d+)', link.get('href', ''))
-            if m:
-                page_nums.append(int(m.group(1)))
-            try:
-                page_nums.append(int(link.get_text(strip=True)))
-            except ValueError:
-                pass
-        if page_nums:
-            return max(page_nums)
-
-    m = re.search(r'(?:showing|page)\s+\d+\s+of\s+(\d+)', soup.get_text(), re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    return 1
-
-
-def parse_page(html, page_num):
+def parse_page(html):
     soup = BeautifulSoup(html, 'lxml')
+    cards = soup.select('.FacultyCard')
     records = []
-
-    card_selectors = [
-        '.faculty-card', '.faculty-item', '.faculty-profile',
-        '[class*="faculty-card"]', '[class*="faculty-item"]',
-        '.profile-card', '.staff-card', '.person-card',
-        '.card', 'article', 'li.faculty',
-    ]
-
-    cards = []
-    used_sel = None
-    for sel in card_selectors:
-        found = soup.select(sel)
-        if found:
-            cards = found
-            used_sel = sel
-            break
-
-    if not cards:
-        print(f"    [warning] No card selector matched on page {page_num} — extracting links")
-        for a in soup.select('a[href*="/faculty/"]'):
-            name = a.get_text(strip=True)
-            href = make_absolute(a.get('href', ''))
-            if name and href:
-                records.append({
-                    'name': name, 'title': '', 'departments': [],
-                    'email': '', 'phone': '', 'office': '', 'bio': '',
-                    'photo_url': '', 'faculty_page_url': href,
-                    'source': ['faculty_listing'],
-                })
-        return records, get_total_pages(soup)
-
-    print(f"    Selector '{used_sel}' → {len(cards)} cards")
     for card in cards:
         record = parse_faculty_card(card)
         if record['name']:
             records.append(record)
-
-    return records, get_total_pages(soup)
+    return records
 
 
 async def run():
@@ -174,7 +108,6 @@ async def run():
 
             html = await page.content()
 
-            # Save raw HTML for the first page to help with selector debugging
             if current_page == 1:
                 raw_path = os.path.join(OUTPUT_DIR, 'faculty_listing_page1.html')
                 with open(raw_path, 'w', encoding='utf-8') as f:
@@ -182,12 +115,12 @@ async def run():
                 await page.screenshot(path=os.path.join(OUTPUT_DIR, 'faculty_listing_page1.png'))
                 print(f"    [saved raw HTML + screenshot → output/]")
 
-            records, total_pages = parse_page(html, current_page)
-            print(f"    {len(records)} records | total pages: {total_pages}")
-            all_records.extend(records)
-
-            if current_page >= total_pages:
+            records = parse_page(html)
+            print(f"    {len(records)} records")
+            if not records:
+                # No cards on this page — we've gone past the last page
                 break
+            all_records.extend(records)
             current_page += 1
             await asyncio.sleep(1.0)
 
