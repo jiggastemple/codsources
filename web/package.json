@@ -1,0 +1,31 @@
+{
+  "name": "expert-sources",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "ingest": "node scripts/ingest.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^1.2.0",
+    "@ai-sdk/openai": "^1.2.0",
+    "ai": "^4.3.0",
+    "better-sqlite3": "^11.0.0",
+    "next": "^15.3.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.0.0"
+  }
+}
