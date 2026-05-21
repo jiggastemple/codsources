@@ -60,6 +60,7 @@ async def get_subject_codes(page):
     except Exception as e:
         print(f"  Navigation warning: {e}")
 
+    page.remove_listener('response', handle_response)
     await page.screenshot(path=os.path.join(OUTPUT_DIR, 'course_catalog_subjects.png'), full_page=True)
 
     if api_response.get('subjects'):
@@ -135,115 +136,109 @@ async def get_subject_codes(page):
 
 
 async def scrape_subject(page, subject_code, subject_name):
-    """Scrape all course sections for one subject. Returns list of course dicts."""
+    """Scrape all course sections for one subject. Returns list of course dicts.
+
+    Instructor data lives in Knockout.js virtual elements that are never stamped
+    into the static DOM — we must intercept the background JSON API calls instead.
+    DOM parsing is kept as a fallback to at least capture course titles/descriptions.
+    """
     url = f"{COURSE_CATALOG_BASE}?subjects={subject_code}"
     print(f"    {subject_code} ({subject_name}): {url}")
 
+    captured = {}
+
+    async def handle_response(response):
+        if response.request.resource_type not in ('xhr', 'fetch'):
+            return
+        url_lower = response.url.lower()
+        if not any(kw in url_lower for kw in ('section', 'course', 'catalog', 'search')):
+            return
+        try:
+            ct = response.headers.get('content-type', '')
+            if 'json' not in ct:
+                return
+            data = await response.json()
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                sample = str(data[0]).lower()
+                if any(k in sample for k in ('faculty', 'instructor', 'section', 'coursename')):
+                    captured.setdefault('sections', []).extend(data)
+            elif isinstance(data, dict):
+                for key in ('Sections', 'sections', 'Courses', 'courses', 'Results', 'results'):
+                    if key in data and isinstance(data[key], list):
+                        captured.setdefault('sections', []).extend(data[key])
+                        break
+        except Exception:
+            pass
+
+    page.on('response', handle_response)
     try:
         await page.goto(url, wait_until='networkidle', timeout=PAGE_LOAD_TIMEOUT)
     except Exception as e:
         print(f"      Navigation error: {e}")
-        return []
-
-    # Wait for Ellucian's Knockout.js to finish rendering course results.
-    # The spinner disappears and a results container appears when loading is done.
-    try:
-        await page.wait_for_selector(
-            '#course-search-result .esg-col-sm-9, '
-            '#course-search-result .esg-col-md-9, '
-            '.catalog-course, .esg-course, '
-            '[data-bind*="courses"], [data-bind*="sections"]',
-            timeout=15000,
-        )
-        await asyncio.sleep(SCROLL_PAUSE)
-    except Exception:
-        pass  # selector didn't appear; try extracting whatever is there
+    await asyncio.sleep(5)
+    page.remove_listener('response', handle_response)
 
     courses = []
 
-    # Extract course data
+    if captured.get('sections'):
+        for sec in captured['sections']:
+            course_code = (
+                sec.get('CourseId') or sec.get('CourseNumber') or
+                sec.get('course_code') or sec.get('Number') or ''
+            )
+            course_name = (
+                sec.get('CourseName') or sec.get('Title') or
+                sec.get('course_name') or sec.get('Name') or ''
+            )
+            raw_faculty = (
+                sec.get('Faculty') or sec.get('Instructors') or
+                sec.get('faculty') or sec.get('instructors') or []
+            )
+            if isinstance(raw_faculty, list):
+                names = []
+                for f in raw_faculty:
+                    if isinstance(f, dict):
+                        n = f.get('Name') or f.get('name') or f.get('InstructorName') or ''
+                    else:
+                        n = str(f)
+                    if n:
+                        names.append(n.strip())
+                instructor = '; '.join(names)
+            else:
+                instructor = str(raw_faculty).strip()
+
+            if course_code or course_name or instructor:
+                courses.append({
+                    'subject_code': subject_code,
+                    'subject_name': subject_name,
+                    'course_code': course_code,
+                    'course_name': course_name,
+                    'instructor': instructor,
+                })
+        print(f"      API interception → {len(courses)} sections")
+        return courses
+
+    # Fallback: API interception captured nothing — parse DOM for course titles only.
+    # Instructors are unavailable this way (they live in KO virtual elements).
+    print(f"      WARNING: no API data captured for {subject_code} — trying DOM fallback")
     content = await page.content()
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(content, 'lxml')
-
-    # Try multiple Colleague Self-Service section patterns
-    section_selectors = [
-        '.course-section', '.section-listing', '.search-result-item',
-        '[class*="course-section"]', '[class*="section-result"]',
-        'tr.section-row', '.section-row', 'article.course',
-        '.course-result', '.availability-section', '.catalog-course',
-    ]
-
-    sections = []
-    used_sel = None
-    for sel in section_selectors:
-        found = soup.select(sel)
-        if found:
-            sections = found
-            used_sel = sel
-            break
-
-    if not sections:
-        # Fallback: look for instructor pattern in page text
-        text = soup.get_text()
-        instructors = re.findall(r'Instructor[:\s]+([A-Z][a-z]+,?\s+[A-Z][a-z]+)', text)
-        for name in set(instructors):
-            courses.append({
-                'subject_code': subject_code,
-                'subject_name': subject_name,
-                'course_code': '',
-                'course_name': '',
-                'instructor': name.strip(),
-            })
-        if courses:
-            print(f"      Fallback text extraction: {len(courses)} instructor mentions")
-        return courses
-
-    print(f"      Selector '{used_sel}' → {len(sections)} sections")
-
-    for section in sections:
-        text = section.get_text(separator=' ', strip=True)
-
-        # Course code (e.g. "ACCOU-1101-001" or "ACCOU 1101")
-        code_match = re.search(
-            r'\b([A-Z]{2,6}[-\s]\d{3,4}(?:[-\s]\d{3})?)\b', text
-        )
-        course_code = code_match.group(1) if code_match else ''
-
-        # Course name — look for a heading within the section
-        name_el = section.select_one(
-            'h2, h3, h4, .course-title, .section-title, [class*="course-name"], [class*="title"]'
-        )
-        course_name = name_el.get_text(strip=True) if name_el else ''
-
-        # Instructor name
-        instructor = ''
-        for sel in [
-            '.instructor', '[class*="instructor"]', '.faculty-name',
-            'td.instructor', '[data-label="Instructor"]',
-        ]:
-            el = section.select_one(sel)
-            if el:
-                instructor = el.get_text(strip=True)
-                break
-
-        if not instructor:
-            m = re.search(
-                r'(?:Instructor|Faculty|Taught by)[:\s]+([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+)',
-                text
-            )
+    for li in soup.select('#course-resultul > li'):
+        h3 = li.select_one('h3 span[id^="course-"]')
+        if h3:
+            text = h3.get_text(strip=True)
+            m = re.match(r'^([A-Z]{2,6}-\d{3,4}[A-Z]?)\s+(.*)', text)
             if m:
-                instructor = m.group(1).strip()
-
-        if course_code or course_name or instructor:
-            courses.append({
-                'subject_code': subject_code,
-                'subject_name': subject_name,
-                'course_code': course_code,
-                'course_name': course_name,
-                'instructor': instructor,
-            })
-
+                courses.append({
+                    'subject_code': subject_code,
+                    'subject_name': subject_name,
+                    'course_code': m.group(1),
+                    'course_name': m.group(2),
+                    'instructor': '',
+                })
+    if courses:
+        print(f"      DOM fallback → {len(courses)} courses (no instructors)")
     return courses
 
 
