@@ -209,6 +209,11 @@ async def scrape_subject(page, subject_code, subject_name, debug_api=False):
             if not capture.get('log'):
                 f.write("  (none — window.__codApiCapture.log is empty)\n")
         print(f"      [debug] {len(capture.get('log', []))} API calls logged → {log_path}")
+        # Dump the raw API payloads so we can identify the exact field names
+        raw_path = os.path.join(OUTPUT_DIR, f'debug_api_{subject_code}_raw.json')
+        with open(raw_path, 'w', encoding='utf-8') as f:
+            json.dump(capture.get('sections', []), f, indent=2, ensure_ascii=False)
+        print(f"      [debug] raw API payloads → {raw_path}")
 
     courses = []
     for item in capture.get('sections', []):
