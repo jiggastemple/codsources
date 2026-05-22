@@ -1,7 +1,7 @@
 import path from 'path';
 import type { FacultyRecord } from './faculty';
 
-const DB_PATH = path.join(process.cwd(), 'data', 'faculty.db');
+const DB_PATH = path.join(__dirname, '..', 'data', 'faculty.db');
 
 export interface DbRow {
   id: string;
