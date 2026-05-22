@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { embedAndSearch } from '@/lib/search';
-import { keywordSearch } from '@/lib/db';
+import { isDbReady, keywordSearch } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: NextRequest) {
+  if (!isDbReady()) {
+    return NextResponse.json({ error: 'db_not_ready' }, { status: 503 });
+  }
+
   const { searchParams } = req.nextUrl;
   const q = searchParams.get('q') ?? '';
   const dept = searchParams.get('dept') ?? undefined;

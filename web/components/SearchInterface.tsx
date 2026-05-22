@@ -44,15 +44,15 @@ export default function SearchInterface() {
       if (q.trim()) params.set('q', q.trim());
       if (dept) params.set('dept', dept);
       const res = await fetch(`/api/search?${params}`);
-      if (!res.ok) throw new Error('Search failed');
-      const data: FacultyRecord[] = await res.json();
-      if (data && !('error' in data)) {
-        setDbReady(true);
-        setResults(data.map(r => ({ ...r, relevance_note: '' })));
-      } else {
+      if (res.status === 503) {
         setDbReady(false);
         setResults([]);
+        return;
       }
+      if (!res.ok) throw new Error('Search failed');
+      const data: FacultyRecord[] = await res.json();
+      setDbReady(true);
+      setResults(data.map(r => ({ ...r, relevance_note: '' })));
     } catch {
       setResults([]);
     } finally {
