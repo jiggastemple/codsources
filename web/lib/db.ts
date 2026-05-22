@@ -93,29 +93,49 @@ export function getById(id: string): FacultyRecord | null {
   }
 }
 
-export function keywordSearch(query: string, topK = 6): FacultyRecord[] {
+export function keywordSearch(query: string, topK = 12, dept?: string): FacultyRecord[] {
   try {
     const db = getDb();
     const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-    if (!terms.length) return [];
 
     const rows = db
-      .prepare('SELECT * FROM faculty WHERE name != "" ORDER BY name LIMIT 500')
+      .prepare('SELECT * FROM faculty WHERE name != "" ORDER BY name')
       .all() as DbRow[];
 
-    const scored = rows.map(row => {
-      const text = [row.name, row.title, row.departments, row.bio, row.courses_taught]
-        .join(' ')
-        .toLowerCase();
-      const score = terms.filter(t => text.includes(t)).length;
-      return { row, score };
-    });
+    const scored = rows
+      .filter(row => !dept || safeParseJson<string[]>(row.departments, []).includes(dept))
+      .map(row => {
+        const text = [row.name, row.title, row.departments, row.bio, row.courses_taught]
+          .join(' ')
+          .toLowerCase();
+        const score = terms.length
+          ? terms.filter(t => text.includes(t)).length
+          : 1; // no query → all match equally (for dept-only browse)
+        return { row, score };
+      });
 
     return scored
       .filter(s => s.score > 0)
       .sort((a, b) => b.score - a.score)
       .slice(0, topK)
       .map(s => parseRow(s.row));
+  } catch {
+    return [];
+  }
+}
+
+export function getUniqueDepartments(): string[] {
+  try {
+    const rows = getDb()
+      .prepare('SELECT departments FROM faculty WHERE departments != "[]" AND departments != ""')
+      .all() as { departments: string }[];
+    const depts = new Set<string>();
+    for (const row of rows) {
+      for (const d of safeParseJson<string[]>(row.departments, [])) {
+        if (d) depts.add(d);
+      }
+    }
+    return [...depts].sort();
   } catch {
     return [];
   }

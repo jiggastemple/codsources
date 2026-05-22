@@ -34,10 +34,15 @@ export function semanticSearch(queryEmbedding: number[], topK = 6): FacultyRecor
     .map(s => s.record);
 }
 
-export async function embedAndSearch(query: string, topK = 6): Promise<FacultyRecord[]> {
+export async function embedAndSearch(query: string, topK = 12, dept?: string): Promise<FacultyRecord[]> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return keywordSearch(query, topK);
+    return keywordSearch(query, topK, dept);
+  }
+
+  // For department-only browsing (no query text), skip embedding and use keyword path
+  if (!query.trim()) {
+    return keywordSearch('', topK, dept);
   }
 
   try {
@@ -48,9 +53,12 @@ export async function embedAndSearch(query: string, topK = 6): Promise<FacultyRe
     });
     if (!res.ok) throw new Error(`OpenAI ${res.status}`);
     const data = await res.json() as { data: Array<{ embedding: number[] }> };
-    return semanticSearch(data.data[0].embedding, topK);
+    const results = semanticSearch(data.data[0].embedding, dept ? topK * 3 : topK);
+    // Apply department filter after semantic retrieval
+    const filtered = dept ? results.filter(r => r.departments.includes(dept)) : results;
+    return filtered.slice(0, topK);
   } catch (err) {
     console.error('[search] embedding failed, falling back to keyword search:', err);
-    return keywordSearch(query, topK);
+    return keywordSearch(query, topK, dept);
   }
 }
