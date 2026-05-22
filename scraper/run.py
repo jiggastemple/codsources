@@ -2,12 +2,13 @@
 Entry point for the COD Expert Sources scraper.
 
 Usage:
-  python run.py                     # Run all scrapers
-  python run.py --skip-courses      # Skip the slow Playwright course catalog scrape
-  python run.py --courses-only      # Only scrape the course catalog, then merge
-  python run.py --subjects ACCOU BIOL  # Limit course catalog to specific subjects (for testing)
-  python run.py --merge-only        # Re-run merge.py on existing output files
-  python run.py --debug-api --subjects ACCOU  # Log all API calls for one subject to diagnose 0-result issues
+  python run.py                          # Run all scrapers (includes profile bio pass)
+  python run.py --skip-profiles          # Skip individual profile pages (faster, no bios)
+  python run.py --skip-courses           # Skip the slow Playwright course catalog scrape
+  python run.py --courses-only           # Only scrape the course catalog, then merge
+  python run.py --subjects ACCOU BIOL    # Limit course catalog to specific subjects (for testing)
+  python run.py --merge-only             # Re-run merge.py on existing output files
+  python run.py --debug-api --subjects ACCOU  # Log all API calls for one subject
 
 All output files are written to the ./output/ directory.
 Raw HTML pages are saved alongside JSON so you can inspect selectors if data looks wrong.
@@ -30,6 +31,7 @@ def main():
     skip_faculty_websites = '--skip-faculty-websites' in args
     skip_faculty_listing  = '--skip-faculty-listing' in args
     skip_courses          = '--skip-courses' in args or '--merge-only' in args
+    skip_profiles         = '--skip-profiles' in args
     courses_only          = '--courses-only' in args
     merge_only            = '--merge-only' in args
     debug_api             = '--debug-api' in args
@@ -58,7 +60,7 @@ def main():
         print_banner("Scraper 2/3: Faculty Listing (cod.edu/_showcase/faculty/)")
         try:
             from faculty_listing import scrape as scrape_listing
-            records = scrape_listing()
+            records = scrape_listing(skip_profiles=skip_profiles)
             print(f"  Done. {len(records)} records.")
         except Exception as e:
             print(f"  ERROR in faculty_listing scraper: {e}")
